@@ -1,0 +1,12 @@
+build/
+
+*.log
+*.map
+*.d
+
+.vscode/
+.idea/
+*.swp
+*.swo
+
+*.test
