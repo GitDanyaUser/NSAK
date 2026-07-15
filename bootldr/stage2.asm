@@ -2,7 +2,7 @@
 [org 0x7e00]
 
 stage2_start:
-    ; 1. Explicitly set DS and ES to 0x0000 so all variables align perfectly
+    ; 1. Explicitly set DS and ES to 0x0000
     xor ax, ax
     mov ds, ax
     mov es, ax
@@ -22,7 +22,25 @@ stage2_start:
     or al, 2
     out 0x92, al
 
-    ; 5. Read the Primary Volume Descriptor (PVD is Sector 16)
+    call detect_memory
+
+    cli
+    lgdt [gdt_descriptor]
+    mov eax, cr0
+    or al, 1
+    mov cr0, eax                ; Turn on PM briefly
+    jmp .flush_unreal
+.flush_unreal:
+    mov ax, 0x10
+    mov fs, ax                  ; Unlock FS limit to 4GB
+    mov eax, cr0
+    and al, 0xFE
+    mov cr0, eax                ; Turn PM off (back to Real Mode)
+    jmp .flush_real
+.flush_real:
+    sti                         ; Re-enable interrupts
+
+    ; 7. Read the Primary Volume Descriptor (PVD is Sector 16)
     mov dword [dap_lba], 16
     mov word [dap_segment], 0x0000
     mov word [dap_offset], 0x9000   ; Low bounce buffer
@@ -33,14 +51,14 @@ stage2_start:
     mov eax, [0x9000 + 158]
     mov [root_dir_lba], eax
 
-    ; 6. Read Root Directory Sector
+    ; 8. Read Root Directory Sector
     mov dword [dap_lba], eax
     mov word [dap_segment], 0x0000
     mov word [dap_offset], 0x9000
     mov word [dap_sectors], 1
     call read_sectors
 
-    ; 7. Parse Directory Records for "NSAKKRNL.BIN;1"
+    ; 9. Parse Directory Records for "NSAKKRNL.BIN;1"
     mov si, 0x9000
 .parse_record:
     mov al, [si]                ; Record size
@@ -92,7 +110,7 @@ stage2_start:
     shr ecx, 11
     mov [kernel_sectors], cx
 
-    ; 8. LOAD KERNEL SECTOR-BY-SECTOR ABOVE 1 MB (0x100000)
+    ; 10. LOAD KERNEL SECTOR-BY-SECTOR ABOVE 1 MB (0x100000)
 .load_loop:
     cmp word [kernel_sectors], 0
     je .loading_done
@@ -105,30 +123,14 @@ stage2_start:
     mov word [dap_sectors], 1
     call read_sectors
 
-    ; --- Unreal mode ---
-    cli                         ; Disable interrupts
-    push ds
-    push es
-    
-    lgdt [gdt_descriptor]       ; Load GDT
+    ; --- MEMORY BOUNDS CHECK ---
+    ; Check if destination + 2048 bytes exceeds detected RAM limit
+    mov eax, [kernel_dest]
+    add eax, 2048
+    cmp eax, [ram_limit]
+    ja .out_of_memory           ; Halt before we overwrite reserved zones or non-existent RAM
 
-    mov eax, cr0
-    or al, 1
-    mov cr0, eax                ; Turn on PM briefly
-    jmp $+2                     ; Flush pipeline
-
-    mov ax, 0x10
-    mov fs, ax                  ; Unlock FS limit to 4GB
-
-    mov eax, cr0
-    and al, 0xFE
-    mov cr0, eax                ; Turn PM off (back to Real Mode)
-    
-    pop es
-    pop ds
-    sti                         ; Re-enable interrupts
-
-    ; Copy 2048 bytes using unlocked FS override (restoring used registers)
+    ; Copy 2048 bytes using unlocked FS override (Fast copy)
     push esi
     push ecx
     push edi
@@ -149,7 +151,6 @@ stage2_start:
     pop edi
     pop ecx
     pop esi
-    ; ------------
 
     ; Safely increment LBA and decrement sectors left in memory
     inc dword [kernel_lba]
@@ -157,7 +158,7 @@ stage2_start:
     jmp .load_loop
 
 .loading_done:
-    ; 9. Switch permanently to Protected Mode
+    ; 11. Switch permanently to Protected Mode
     cli
     lgdt [gdt_descriptor]
     mov eax, cr0
@@ -166,12 +167,20 @@ stage2_start:
     jmp 0x08:init_pm
 
 .file_not_found:
-    mov si, msg_err
+    mov si, msg_nofile
     call print_string
     cli
 .halt_not_found:
     hlt
     jmp .halt_not_found
+
+.out_of_memory:
+    mov si, msg_oom
+    call print_string
+    cli
+.halt_oom:
+    hlt
+    jmp .halt_oom
 
 ; --- HELPERS ---
 print_string:
@@ -199,17 +208,58 @@ read_sectors:
     hlt
     jmp .halt_error
 
+detect_memory:
+    xor cx, cx
+    xor dx, dx
+    mov ax, 0xE801
+    int 0x15
+    jc .error           ; If carry flag set, BIOS E801 failed
+
+    ; On some BIOSes, results are returned in CX/DX instead of AX/BX
+    cmp ax, 0
+    jne .use_ax_bx
+    mov ax, cx
+    mov bx, dx
+
+.use_ax_bx:
+    ; AX = Memory between 1MB and 16MB (in KB)
+    ; BX = Memory above 16MB (in 64KB blocks)
+    
+    ; Convert AX (KB) to Bytes -> AX * 1024
+    movzx eax, ax
+    shl eax, 10         ; EAX = Bytes of RAM between 1MB and 16MB
+
+    ; Convert BX (64KB blocks) to Bytes -> BX * 65536
+    movzx ebx, bx
+    shl ebx, 16         ; EBX = Bytes of RAM above 16MB
+
+    ; Total RAM above 1MB = EAX + EBX
+    add eax, ebx
+    
+    ; Add the baseline 1MB (0x100000) to get the absolute RAM upper limit address
+    add eax, 0x100000
+    mov [ram_limit], eax
+    ret
+
+.error:
+    ; Fallback, if BIOS doesn't support let's assume we have 32MB free
+    mov dword [ram_limit], 0x02000000 
+    ret
+
 ; --- DATA ---
 boot_drive:      db 0
 root_dir_lba:    dd 0
 kernel_lba:      dd 0
 kernel_sectors:  dw 0
 kernel_dest:     dd 0x100000 ; Track destination pointer in RAM
+ram_limit:       dd 0x01000000 ; Upper limit of usable RAM (Defaults to 16MB)
 file_record_ptr: dw 0
 filename:        db "NSAKKRNL.BIN;1"
 msg_sig:         db "NSAKB", 13, 10, 0
 msg_found:       db "Loading kernel...", 13, 10, 0
 msg_err:         db "FS Error!", 13, 10, 0
+msg_nofile:      db "No Kernel!", 13, 10, 0
+msg_oom:         db "Out of Memory!", 13, 10, 0
 
 align 4
 dap:
